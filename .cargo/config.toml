@@ -1,0 +1,26 @@
+[source.crates-io]
+replace-with = 'sjtu'
+
+# 中国科学技术大学
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+[registries.ustc]
+index = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+# 清华大学
+[source.tuna]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+[registries.tuna]
+index = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+
+# 上海交通大学
+[source.sjtu]
+registry = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
+[registries.sjtu]
+index = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
+
+# 浙江大学
+[source.zju]
+registry = "sparse+https://mirrors.zju.edu.cn/crates.io-index/"
+[registries.zju]
+index = "sparse+https://mirrors.zju.edu.cn/crates.io-index/"

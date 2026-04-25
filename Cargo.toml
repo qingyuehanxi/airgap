@@ -1,0 +1,41 @@
+[workspace]
+resolver = '3'
+members = ["airgap-core", "airgap-online", "airgap-offline"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+
+[workspace.dependencies]
+tokio = { version = "1.52", features = ["full", "time"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["local-time"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+iced = "0.14"
+near-primitives = "0.34"
+near-crypto = "0.34"
+base64 = "0.22"
+argon2 = "0.5"
+aes-gcm = "0.10"
+borsh = "1.6"
+unicode-normalization = "0.1"
+bip39 = { version = "2.2", features = ["rand", "chinese-simplified"] }
+bs58 = "0.5"
+ed25519-dalek = "2"
+near-slip10 = "0.4.7"
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+uuid = { version = "1.23", features = [
+    "v4",
+    "v7",
+    "fast-rng",
+    "macro-diagnostics",
+] }
+sled = "0.34"
