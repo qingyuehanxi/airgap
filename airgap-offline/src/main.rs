@@ -3,8 +3,8 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
 };
 use airgap_core::{
-    PasswordPolicy, SignedTransactionResponse, UnsignedTransactionRequest, VerifiedTransferRequest, request_from_json,
-    response_to_pretty_json, sign_transfer_request, verify_transfer_request,
+    PasswordPolicy, SignedTransactionResponse, UnsignedTransactionRequest, VerifiedRequest,
+    cfg::language::SupportLanguage, request_from_json, response_to_pretty_json, sign_request, verify_request,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -12,8 +12,8 @@ use bip39::{Language, Mnemonic};
 use bs58::encode as bs58_encode;
 use ed25519_dalek::SigningKey;
 use iced::{
-    Alignment, Border, Color, Element, Length, Task, clipboard,
-    widget::{button, column, container, pane_grid, pick_list, row, scrollable, text, text_input},
+    Alignment, Background, Border, Color, Element, Length, Task, clipboard,
+    widget::{button, column, container, pick_list, row, scrollable, svg, text, text_input},
 };
 use near_crypto::SecretKey;
 use near_primitives::types::AccountId;
@@ -26,10 +26,13 @@ const VAULT_VERIFIER_KEY: &[u8] = b"vault_verifier";
 const ACCOUNTS_DB_KEY: &[u8] = b"saved_accounts";
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
-const SIDEBAR_RATIO: f32 = 0.24;
 const SAVED_ACCOUNT_COLUMN_WIDTH: f32 = 180.0;
 const SAVED_MNEMONIC_COLUMN_WIDTH: f32 = 170.0;
+const SAVED_ACTION_COLUMN_WIDTH: f32 = 96.0;
+const COPY_ICON_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../asset/mingcute-copy.svg");
+const DELETE_ICON_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../asset/mingcute-delete.svg");
 const DEFAULT_SEED_PHRASE_HD_PATH: &str = "m/44'/397'/0'";
+const SUPPORTED_LANGUAGES: [SupportLanguage; 2] = [SupportLanguage::English, SupportLanguage::Chinese];
 
 fn main() -> iced::Result {
     iced::application(OfflineApp::default, OfflineApp::update, OfflineApp::view)
@@ -53,7 +56,18 @@ fn output_dir() -> PathBuf {
 }
 
 fn default_output_path() -> String {
-    output_dir().join("signed-response.json").display().to_string()
+    output_dir().join("transaction-signed.json").display().to_string()
+}
+
+fn default_request_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home)
+        .join(".airgap")
+        .join("airgap-online")
+        .join("out")
+        .join("transaction-unsigned.json")
+        .display()
+        .to_string()
 }
 
 fn parse_output_path(value: &str) -> Result<PathBuf, String> {
@@ -79,13 +93,14 @@ enum Message {
     CancelVaultResetPressed,
     ConfirmVaultResetPressed,
     TabSelected(Tab),
-    SplitResized(pane_grid::ResizeEvent),
+    LanguageChanged(SupportLanguage),
     AccountIdChanged(String),
     MnemonicChanged(String),
     SaveAccountPressed,
+    RemoveAccountPressed { account_id: String, public_key: String },
     MnemonicLanguageSelected(MnemonicLanguage),
     GenerateMnemonicPressed,
-    CopyGeneratedMnemonicPressed(String),
+    CopyPressed(String),
     LoadRequestPressed,
     RequestFileChanged(String),
     RequestLoaded(Result<LoadedRequest, String>),
@@ -94,6 +109,11 @@ enum Message {
     OutputChanged(String),
     ExportPressed,
     Exported(Result<PathBuf, String>),
+    CurrentPasswordChanged(String),
+    NewPasswordChanged(String),
+    ConfirmNewPasswordChanged(String),
+    ChangePasswordPressed,
+    PasswordChanged(Result<(), String>),
     ResetPressed,
 }
 
@@ -102,6 +122,7 @@ enum Tab {
     Sign,
     Accounts,
     Mnemonic,
+    Password,
 }
 
 #[derive(Debug)]
@@ -119,7 +140,7 @@ struct LockedState {
 #[derive(Debug)]
 struct UnlockedState {
     active_tab: Tab,
-    layout: pane_grid::State<LayoutPane>,
+    language: SupportLanguage,
     session: VaultSession,
     account_id_input: String,
     mnemonic_input: String,
@@ -128,6 +149,9 @@ struct UnlockedState {
     sign_state: SignState,
     request_file_path: String,
     output: String,
+    current_password_input: String,
+    new_password_input: String,
+    confirm_new_password_input: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +174,7 @@ enum SignState {
     Idle,
     RequestLoaded(LoadedRequest),
     Signed(SignedTransactionResponse),
-    Exported(PathBuf),
+    Exported,
 }
 
 #[derive(Debug)]
@@ -164,7 +188,7 @@ enum Status {
 #[derive(Debug, Clone)]
 struct LoadedRequest {
     request: UnsignedTransactionRequest,
-    verified: VerifiedTransferRequest,
+    verified: VerifiedRequest,
 }
 
 #[derive(Debug, Clone)]
@@ -191,16 +215,17 @@ struct EncryptedSecret {
     ciphertext_base64: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum LayoutPane {
-    Sidebar,
-    Main,
-}
-
 struct OfflineApp {
     db: sled::Db,
     screen: AppScreen,
     status: Status,
+}
+
+fn locked_state() -> LockedState {
+    LockedState {
+        password: String::new(),
+        reset_confirmation_required: false,
+    }
 }
 
 impl Default for OfflineApp {
@@ -209,10 +234,7 @@ impl Default for OfflineApp {
 
         Self {
             db,
-            screen: AppScreen::Locked(LockedState {
-                password: String::new(),
-                reset_confirmation_required: false,
-            }),
+            screen: AppScreen::Locked(locked_state()),
             status: Status::Idle,
         }
     }
@@ -245,10 +267,7 @@ impl OfflineApp {
             }
             Message::ConfirmVaultResetPressed => match reset_vault(&self.db) {
                 Ok(()) => {
-                    self.screen = AppScreen::Locked(LockedState {
-                        password: String::new(),
-                        reset_confirmation_required: false,
-                    });
+                    self.screen = AppScreen::Locked(locked_state());
                     self.status = Status::Success(
                         "Local vault deleted. You can now create a new session password and start fresh.".to_owned(),
                     );
@@ -268,14 +287,17 @@ impl OfflineApp {
                 Ok(session) => {
                     self.screen = AppScreen::Unlocked(UnlockedState {
                         active_tab: Tab::Sign,
-                        layout: build_split_layout(),
+                        language: SupportLanguage::English,
                         sign_state: SignState::Idle,
-                        request_file_path: String::new(),
+                        request_file_path: default_request_path(),
                         output: default_output_path(),
                         account_id_input: String::new(),
                         mnemonic_input: String::new(),
-                        mnemonic_language: MnemonicLanguage::ChineseSimplified,
+                        mnemonic_language: MnemonicLanguage::English,
                         generated_mnemonic: String::new(),
+                        current_password_input: String::new(),
+                        new_password_input: String::new(),
+                        confirm_new_password_input: String::new(),
                         session,
                     });
                     self.status = Status::Success(
@@ -292,9 +314,9 @@ impl OfflineApp {
                     }
                 }
             }
-            Message::SplitResized(event) => {
+            Message::LanguageChanged(language) => {
                 if let AppScreen::Unlocked(unlocked) = &mut self.screen {
-                    unlocked.layout.resize(event.split, event.ratio);
+                    unlocked.language = language;
                 }
             }
             Message::AccountIdChanged(value) => {
@@ -326,6 +348,18 @@ impl OfflineApp {
                     }
                 }
             }
+            Message::RemoveAccountPressed { account_id, public_key } => {
+                if let AppScreen::Unlocked(unlocked) = &mut self.screen {
+                    match remove_account(&self.db, &mut unlocked.session, &account_id, &public_key) {
+                        Ok(removed_account_id) => {
+                            self.status = Status::Success(format!(
+                                "Removed account {removed_account_id} from the offline keychain."
+                            ));
+                        }
+                        Err(error) => self.status = Status::Error(error),
+                    }
+                }
+            }
             Message::GenerateMnemonicPressed => {
                 if let AppScreen::Unlocked(unlocked) = &mut self.screen {
                     match generate_mnemonic(unlocked.mnemonic_language) {
@@ -349,8 +383,8 @@ impl OfflineApp {
                     }
                 }
             }
-            Message::CopyGeneratedMnemonicPressed(mnemonic) => {
-                return clipboard::write(mnemonic);
+            Message::CopyPressed(content) => {
+                return clipboard::write(content);
             }
             Message::LoadRequestPressed => {
                 let path = match &self.screen {
@@ -399,7 +433,7 @@ impl OfflineApp {
                     }
                 };
                 return Task::perform(
-                    async move { sign_transfer_request(&request, &secret_key).map_err(|e| e.to_string()) },
+                    async move { sign_request(&request, &secret_key).map_err(|e| e.to_string()) },
                     Message::Signed,
                 );
             }
@@ -419,6 +453,45 @@ impl OfflineApp {
                     unlocked.output = value;
                 }
             }
+            Message::CurrentPasswordChanged(value) => {
+                if let AppScreen::Unlocked(unlocked) = &mut self.screen {
+                    unlocked.current_password_input = value;
+                }
+            }
+            Message::NewPasswordChanged(value) => {
+                if let AppScreen::Unlocked(unlocked) = &mut self.screen {
+                    unlocked.new_password_input = value;
+                }
+            }
+            Message::ConfirmNewPasswordChanged(value) => {
+                if let AppScreen::Unlocked(unlocked) = &mut self.screen {
+                    unlocked.confirm_new_password_input = value;
+                }
+            }
+            Message::ChangePasswordPressed => {
+                let (current_password, new_password, confirm_new_password) = match &self.screen {
+                    AppScreen::Unlocked(unlocked) => (
+                        unlocked.current_password_input.trim().to_owned(),
+                        unlocked.new_password_input.trim().to_owned(),
+                        unlocked.confirm_new_password_input.trim().to_owned(),
+                    ),
+                    AppScreen::Locked(_) => return Task::none(),
+                };
+                let db = self.db.clone();
+                self.status = Status::Success("Migrating vault to the new password...".to_owned());
+                return Task::perform(
+                    change_vault_password(db, current_password, new_password, confirm_new_password),
+                    Message::PasswordChanged,
+                );
+            }
+            Message::PasswordChanged(result) => match result {
+                Ok(()) => {
+                    self.screen = AppScreen::Locked(locked_state());
+                    self.status =
+                        Status::Success("Password updated and vault re-encrypted. Please log in again.".to_owned());
+                }
+                Err(error) => self.status = Status::Error(error),
+            },
             Message::ExportPressed => {
                 let (response, output) = match &self.screen {
                     AppScreen::Unlocked(unlocked) => match &unlocked.sign_state {
@@ -442,7 +515,8 @@ impl OfflineApp {
                 if let AppScreen::Unlocked(unlocked) = &mut self.screen {
                     match result {
                         Ok(path) => {
-                            unlocked.sign_state = SignState::Exported(path);
+                            let _ = path;
+                            unlocked.sign_state = SignState::Exported;
                             self.status = Status::Success("Signed response exported.".to_owned());
                         }
                         Err(error) => self.status = Status::Error(error),
@@ -502,25 +576,23 @@ fn locked_view<'a>(locked: &'a LockedState, status: &'a Status) -> Element<'a, M
         .into()
     };
 
-    let content =
+    let content = container(
         column![
-        text("🔐 Airgap Offline").size(34),
-        text(
-            "Enter the one-time password for this session. Stored mnemonics will be decrypted into memory after unlock."
-        )
-        .size(16),
-        column![
-            text("Session password").size(14),
-            text_input("Session password", &locked.password)
-                .on_input(Message::UnlockPasswordChanged)
-                .secure(true)
-                .padding(12)
-                .size(16)
-                .width(Length::Fill),
-        ]
-        .spacing(8)
-        .width(Length::Fill),
-        container(
+            section_heading(
+                "Unlock offline vault",
+                "Enter the session password to decrypt stored mnemonics into memory for this air-gapped signing session."
+            ),
+            column![
+                text("Session password").size(14),
+                text_input("Session password", &locked.password)
+                    .on_input(Message::UnlockPasswordChanged)
+                    .secure(true)
+                    .padding(12)
+                    .size(16)
+                    .width(Length::Fill),
+            ]
+            .spacing(8)
+            .width(Length::Fill),
             row![
                 reset_controls,
                 button(container(text("Unlock").size(14)).width(Length::Fill).center_x(Length::Fill))
@@ -530,79 +602,77 @@ fn locked_view<'a>(locked: &'a LockedState, status: &'a Status) -> Element<'a, M
             ]
             .spacing(12)
             .align_y(Alignment::Center),
-        )
-        .width(Length::Fill)
-        .center_x(Length::Fill),
-        status_view(status),
-    ]
+            status_view(status),
+        ]
         .spacing(24)
-        .padding(32)
-        .max_width(640)
-        .align_x(Alignment::Center);
+        .width(Length::Fill),
+    )
+    .padding(28)
+    .width(Length::Fill)
+    .max_width(720)
+    .style(|_| card_style());
 
-    container(container(content).center_x(Length::Fill).center_y(Length::Fill))
+    let shell = column![
+        top_bar(None),
+        container(content).center_x(Length::Fill).center_y(Length::Fill)
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .spacing(0);
+
+    container(shell)
         .width(Length::Fill)
         .height(Length::Fill)
+        .style(|_| iced::widget::container::Style {
+            background: Some(Background::Color(Color::from_rgb8(247, 248, 252))),
+            ..Default::default()
+        })
         .into()
 }
 
 fn unlocked_view<'a>(unlocked: &'a UnlockedState, status: &'a Status) -> Element<'a, Message> {
-    pane_grid(&unlocked.layout, |_, pane, _| match pane {
-        LayoutPane::Sidebar => pane_grid::Content::new(sidebar_view(unlocked)),
-        LayoutPane::Main => pane_grid::Content::new(main_view(unlocked, status)),
-    })
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .spacing(1)
-    .on_resize(8, Message::SplitResized)
-    .into()
-}
+    let shell = column![top_bar(Some(unlocked.language)), main_view(unlocked, status)]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .spacing(0);
 
-fn sidebar_view<'a>(unlocked: &'a UnlockedState) -> Element<'a, Message> {
-    container(
-        column![
-            text("🔐 Airgap Offline").size(24),
-            text("Offline vault").size(14),
-            tab_button("Sign", Tab::Sign, unlocked.active_tab),
-            tab_button("Keychain", Tab::Accounts, unlocked.active_tab),
-            tab_button("Mnemonic", Tab::Mnemonic, unlocked.active_tab),
-        ]
-        .spacing(16)
-        .padding(20)
-        .align_x(Alignment::Start),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    container(shell)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| iced::widget::container::Style {
+            background: Some(Background::Color(Color::from_rgb8(247, 248, 252))),
+            ..Default::default()
+        })
+        .into()
 }
 
 fn main_view<'a>(unlocked: &'a UnlockedState, status: &'a Status) -> Element<'a, Message> {
+    let hero = hero_section(unlocked.active_tab);
+    let tabs = tab_strip(unlocked.active_tab);
     let body = match unlocked.active_tab {
         Tab::Sign => signing_tab(unlocked),
         Tab::Accounts => accounts_tab(unlocked),
         Tab::Mnemonic => mnemonic_tab(unlocked),
+        Tab::Password => password_tab(unlocked),
     };
 
     scrollable(
         container(
-            column![body, status_view(status)]
-                .spacing(24)
-                .padding(28)
-                .width(Length::Fill),
+            container(
+                column![hero, tabs, body, status_view(status)]
+                    .spacing(24)
+                    .width(Length::Fill),
+            )
+            .width(Length::Fill)
+            .max_width(1120),
         )
-        .width(Length::Fill),
+        .width(Length::Fill)
+        .padding([28, 32])
+        .center_x(Length::Fill),
     )
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
-}
-
-fn tab_button<'a>(label: &'a str, tab: Tab, active_tab: Tab) -> Element<'a, Message> {
-    let mut button_view = button(text(label).size(15)).padding([10, 18]).width(Length::Fill);
-    if tab != active_tab {
-        button_view = button_view.on_press(Message::TabSelected(tab));
-    }
-    button_view.into()
 }
 
 fn accounts_tab<'a>(unlocked: &'a UnlockedState) -> Element<'a, Message> {
@@ -612,28 +682,32 @@ fn accounts_tab<'a>(unlocked: &'a UnlockedState) -> Element<'a, Message> {
         saved_accounts_table(&unlocked.session.accounts)
     };
 
-    column![
-        text("Keychain").size(22),
-        text(
-            "Each mnemonic is encrypted in sled and only decrypted into memory after the session password is entered."
-        )
-        .size(14),
-        row![
-            field("Account", &unlocked.account_id_input, Message::AccountIdChanged),
-            multiline_field(
-                "Mnemonic / Seed Phrase",
-                &unlocked.mnemonic_input,
-                Message::MnemonicChanged
+    container(
+        column![
+            section_heading(
+                "Offline keychain",
+                "Encrypt mnemonics in local storage and unlock them only for the current signing session."
             ),
+            row![
+                field("Account", &unlocked.account_id_input, Message::AccountIdChanged),
+                multiline_field(
+                    "Mnemonic / Seed Phrase",
+                    &unlocked.mnemonic_input,
+                    Message::MnemonicChanged
+                ),
+            ]
+            .spacing(16),
+            button(text("Save Account").size(16))
+                .padding([12, 18])
+                .on_press(Message::SaveAccountPressed),
+            accounts,
         ]
-        .spacing(16),
-        button(text("Save Account").size(16))
-            .padding([12, 18])
-            .on_press(Message::SaveAccountPressed),
-        accounts,
-    ]
-    .spacing(20)
+        .spacing(20)
+        .width(Length::Fill),
+    )
+    .padding(28)
     .width(Length::Fill)
+    .style(|_| card_style())
     .into()
 }
 
@@ -641,17 +715,30 @@ fn mnemonic_tab<'a>(unlocked: &'a UnlockedState) -> Element<'a, Message> {
     let generated_view: Element<'a, Message> = if unlocked.generated_mnemonic.is_empty() {
         text("No mnemonic generated yet.").size(14).into()
     } else {
+        let generated_public_key = derive_public_key_from_mnemonic(&unlocked.generated_mnemonic).ok();
+        let generated_public_key_text = generated_public_key
+            .clone()
+            .unwrap_or_else(|| "Unable to derive public key".to_owned());
+        let mut copy_public_key_button = copy_icon_button();
+        if let Some(public_key) = generated_public_key.clone() {
+            copy_public_key_button = copy_public_key_button.on_press(Message::CopyPressed(public_key));
+        }
         column![
             text("Generated Mnemonic").size(18),
             row![
                 container(text(unlocked.generated_mnemonic.as_str()).size(16))
                     .padding(16)
                     .width(Length::Fill),
-                button(text("Copy").size(14))
-                    .padding([10, 16])
-                    .on_press(Message::CopyGeneratedMnemonicPressed(
-                        unlocked.generated_mnemonic.clone()
-                    )),
+                copy_icon_button().on_press(Message::CopyPressed(unlocked.generated_mnemonic.clone())),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+            text("Derived Public Key").size(18),
+            row![
+                container(text(generated_public_key_text).size(16))
+                    .padding(16)
+                    .width(Length::Fill),
+                copy_public_key_button,
             ]
             .spacing(12)
             .align_y(Alignment::Center),
@@ -661,26 +748,34 @@ fn mnemonic_tab<'a>(unlocked: &'a UnlockedState) -> Element<'a, Message> {
         .into()
     };
 
-    column![
-        text("Mnemonic Generator").size(22),
-        text(mnemonic_generator_hint(unlocked.mnemonic_language)).size(14),
+    container(
         column![
-            text("Language").size(14),
-            pick_list(
-                [MnemonicLanguage::ChineseSimplified, MnemonicLanguage::English],
-                Some(unlocked.mnemonic_language),
-                Message::MnemonicLanguageSelected
-            )
-            .width(Length::Fill),
+            section_heading(
+                "Mnemonic generator",
+                "Create a fresh 12-word mnemonic offline and move it directly into your secure storage workflow."
+            ),
+            text(mnemonic_generator_hint(unlocked.mnemonic_language)).size(14),
+            column![
+                text("Language").size(14),
+                pick_list(
+                    [MnemonicLanguage::ChineseSimplified, MnemonicLanguage::English],
+                    Some(unlocked.mnemonic_language),
+                    Message::MnemonicLanguageSelected
+                )
+                .width(Length::Fill),
+            ]
+            .spacing(8),
+            button(text("Generate Mnemonic").size(16))
+                .padding([12, 18])
+                .on_press(Message::GenerateMnemonicPressed),
+            generated_view,
         ]
-        .spacing(8),
-        button(text("Generate Mnemonic").size(16))
-            .padding([12, 18])
-            .on_press(Message::GenerateMnemonicPressed),
-        generated_view,
-    ]
-    .spacing(20)
+        .spacing(20)
+        .width(Length::Fill),
+    )
+    .padding(28)
     .width(Length::Fill)
+    .style(|_| card_style())
     .into()
 }
 
@@ -689,6 +784,7 @@ fn saved_accounts_table(accounts: &[UnlockedAccount]) -> Element<'_, Message> {
         container(text("Account").size(14)).width(SAVED_ACCOUNT_COLUMN_WIDTH),
         container(text("Mnemonic").size(14)).width(SAVED_MNEMONIC_COLUMN_WIDTH),
         container(text("Public Key").size(14)).width(Length::Fill),
+        container(text("Action").size(14)).width(SAVED_ACTION_COLUMN_WIDTH),
     ]
     .spacing(16)
     .align_y(Alignment::Center);
@@ -705,11 +801,27 @@ fn saved_accounts_table(accounts: &[UnlockedAccount]) -> Element<'_, Message> {
 }
 
 fn saved_account_row(account: &UnlockedAccount) -> Element<'_, Message> {
+    let public_key = derive_public_key(account);
+
     column![
         row![
             container(text(&account.account_id).size(15)).width(SAVED_ACCOUNT_COLUMN_WIDTH),
             container(text(mask_mnemonic(&account.mnemonic)).size(13)).width(SAVED_MNEMONIC_COLUMN_WIDTH),
-            container(text(derive_public_key(account)).size(13)).width(Length::Fill),
+            container(text(short_public_key(&public_key)).size(13)).width(Length::Fill),
+            container(
+                button(
+                    svg(svg::Handle::from_path(DELETE_ICON_PATH))
+                        .width(Length::Fixed(16.0))
+                        .height(Length::Fixed(16.0))
+                )
+                .padding([6, 10])
+                .style(iced::widget::button::text)
+                .on_press(Message::RemoveAccountPressed {
+                    account_id: account.account_id.clone(),
+                    public_key: public_key.clone(),
+                })
+            )
+            .width(SAVED_ACTION_COLUMN_WIDTH),
         ]
         .spacing(16)
         .align_y(Alignment::Center),
@@ -717,6 +829,27 @@ fn saved_account_row(account: &UnlockedAccount) -> Element<'_, Message> {
     ]
     .spacing(10)
     .into()
+}
+
+fn short_public_key(value: &str) -> String {
+    const PREFIX: &str = "ed25519:";
+    if let Some(raw) = value.strip_prefix(PREFIX) {
+        let char_count = raw.chars().count();
+        if char_count > 10 {
+            let start: String = raw.chars().take(5).collect();
+            let end: String = raw
+                .chars()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            return format!("{PREFIX}{start}...{end}");
+        }
+    }
+
+    value.to_owned()
 }
 
 fn table_divider() -> Element<'static, Message> {
@@ -738,37 +871,60 @@ fn table_divider() -> Element<'static, Message> {
 }
 
 fn signing_tab<'a>(unlocked: &'a UnlockedState) -> Element<'a, Message> {
-    column![
-        mnemonic_status_view(&unlocked.session),
-        signing_keychain_view(&unlocked.session, &unlocked.sign_state),
-        signing_section(&unlocked.sign_state, &unlocked.request_file_path, &unlocked.output),
-        actions_row(&unlocked.sign_state),
-    ]
-    .spacing(24)
+    container(
+        column![
+            section_heading(
+                "Sign offline request",
+                "Review transfer or key-management requests from the online machine, match them against your offline keychain, then export the signed response."
+            ),
+            signing_keychain_view(&unlocked.session, &unlocked.sign_state),
+            signing_section(&unlocked.sign_state, &unlocked.request_file_path, &unlocked.output),
+            actions_row(&unlocked.sign_state),
+        ]
+        .spacing(24)
+        .width(Length::Fill),
+    )
+    .padding(28)
     .width(Length::Fill)
+    .style(|_| card_style())
     .into()
 }
 
-fn mnemonic_status_view(session: &VaultSession) -> Element<'_, Message> {
-    let summary = if session.accounts.is_empty() {
-        "0 unlocked accounts in memory".to_owned()
-    } else {
-        format!("{} unlocked account(s) in memory", session.accounts.len())
-    };
-
-    column![
-        text("Vault Session").size(18),
-        text(summary).size(14),
-        text("This prepares the in-memory account list for a future signer account dropdown.").size(13),
-    ]
-    .spacing(6)
+fn password_tab<'a>(unlocked: &'a UnlockedState) -> Element<'a, Message> {
+    container(
+        column![
+            section_heading(
+                "Change vault password",
+                "Use the current password to unlock existing data, then migrate all saved keychain mnemonics to a new password."
+            ),
+            field_secure("Current password", &unlocked.current_password_input, Message::CurrentPasswordChanged),
+            field_secure("New password", &unlocked.new_password_input, Message::NewPasswordChanged),
+            field_secure(
+                "Confirm new password",
+                &unlocked.confirm_new_password_input,
+                Message::ConfirmNewPasswordChanged
+            ),
+            text("After the migration finishes, the app will return to the login screen and require the new password.")
+                .size(13)
+                .color(Color::from_rgb8(95, 103, 120)),
+            button(container(text("Change Password").size(14)).width(Length::Fill).center_x(Length::Fill))
+                .padding([10, 18])
+                .width(Length::Fixed(220.0))
+                .on_press(Message::ChangePasswordPressed),
+        ]
+        .spacing(18)
+        .width(Length::Fill),
+    )
+    .padding(28)
+    .width(Length::Fill)
+    .style(|_| card_style())
     .into()
 }
 
 fn signing_keychain_view<'a>(session: &'a VaultSession, sign_state: &'a SignState) -> Element<'a, Message> {
     let helper = match sign_state {
         SignState::RequestLoaded(loaded) => {
-            let signer = &loaded.verified.signer_id;
+            let signer = verified_signer_id(&loaded.verified);
             if session.accounts.iter().any(|account| account.account_id == *signer) {
                 format!("Keychain contains {signer}. Signing will derive its key from the stored mnemonic.")
             } else {
@@ -812,12 +968,8 @@ fn signing_section<'a>(sign_state: &'a SignState, request_file_path: &'a str, ou
         SignState::RequestLoaded(loaded) => {
             sections.push(transaction_details_view(&loaded.verified));
         }
-        SignState::Signed(response) => {
-            sections.push(signed_details_view(response));
-        }
-        SignState::Exported(path) => {
-            sections.push(exported_view(path));
-        }
+        SignState::Exported => {}
+        SignState::Signed(_) => {}
     }
 
     sections.push(
@@ -833,24 +985,74 @@ fn signing_section<'a>(sign_state: &'a SignState, request_file_path: &'a str, ou
         .into(),
     );
 
+    if let SignState::Signed(response) = sign_state {
+        sections.push(signed_details_view(response));
+    }
+
     column(sections).spacing(24).into()
 }
 
-fn transaction_details_view(request: &VerifiedTransferRequest) -> Element<'_, Message> {
+fn transaction_details_view(request: &VerifiedRequest) -> Element<'_, Message> {
+    let details = match request {
+        VerifiedRequest::Transfer(request) => column![
+            detail_row("Type".into(), "Transfer".to_owned()),
+            detail_row("Network".into(), request.network.to_string()),
+            detail_row("Signer".into(), request.signer_id.clone()),
+            detail_row("Signer Public Key".into(), request.signer_public_key.clone()),
+            detail_row("Receiver".into(), request.receiver_id.clone()),
+            detail_row("Nonce".into(), request.nonce.to_string()),
+            detail_row("Recent Block Hash".into(), request.block_hash.clone()),
+            detail_row("Deposit".into(), format_near_amount(&request.deposit_yocto_near)),
+            detail_row("Request ID".into(), request.request_id.clone()),
+        ]
+        .spacing(8),
+        VerifiedRequest::DeleteKey(request) => column![
+            detail_row("Type".into(), "DeleteKey".to_owned()),
+            detail_row("Network".into(), request.network.to_string()),
+            detail_row("Signer".into(), request.signer_id.clone()),
+            detail_row("Signer Public Key".into(), request.signer_public_key.clone()),
+            detail_row("Account".into(), request.receiver_id.clone()),
+            detail_row("Delete Public Key".into(), request.delete_public_key.clone()),
+            detail_row("Nonce".into(), request.nonce.to_string()),
+            detail_row("Recent Block Hash".into(), request.block_hash.clone()),
+            detail_row("Request ID".into(), request.request_id.clone()),
+        ]
+        .spacing(8),
+        VerifiedRequest::AddKey(request) => column![
+            detail_row("Type".into(), "AddKey".to_owned()),
+            detail_row("Network".into(), request.network.to_string()),
+            detail_row("Signer".into(), request.signer_id.clone()),
+            detail_row("Signer Public Key".into(), request.signer_public_key.clone()),
+            detail_row("Account".into(), request.receiver_id.clone()),
+            detail_row("Add Public Key".into(), request.add_public_key.clone()),
+            detail_row("Permission".into(), request.permission.clone()),
+            detail_row("Nonce".into(), request.nonce.to_string()),
+            detail_row("Recent Block Hash".into(), request.block_hash.clone()),
+            detail_row("Request ID".into(), request.request_id.clone()),
+        ]
+        .spacing(8),
+    };
+
+    info_card("Transaction Details", details).into()
+}
+
+fn signed_details_view(response: &SignedTransactionResponse) -> Element<'_, Message> {
     let details = column![
-        detail_row("Network".into(), request.network.to_string()),
-        detail_row("Signer".into(), request.signer_id.clone()),
-        detail_row("Signer Public Key".into(), request.signer_public_key.clone()),
-        detail_row("Receiver".into(), request.receiver_id.clone()),
-        detail_row("Nonce".into(), request.nonce.to_string()),
-        detail_row("Recent Block Hash".into(), request.block_hash.clone()),
-        detail_row("Deposit".into(), format_near_amount(&request.deposit_yocto_near)),
-        detail_row("Request ID".into(), request.request_id.clone()),
+        detail_row("Request ID".into(), response.request_id.clone()),
+        detail_row("Public Key".into(), response.public_key.clone()),
+        detail_row("Signature".into(), response.signature.clone()),
     ]
     .spacing(8);
 
+    info_card("Signed Response", details).into()
+}
+
+fn info_card<'a>(
+    title: &'static str,
+    content: impl Into<Element<'a, Message>>,
+) -> iced::widget::Container<'a, Message> {
     container(
-        column![text("Transaction Details").size(16), details]
+        column![text(title).size(16), content.into()]
             .spacing(12)
             .width(Length::Fill),
     )
@@ -860,41 +1062,13 @@ fn transaction_details_view(request: &VerifiedTransferRequest) -> Element<'_, Me
         border: Border {
             width: 1.0,
             radius: 10.0.into(),
-            color: Color::from_rgb8(34, 197, 94),
+            color: Color::from_rgb8(59, 130, 246),
         },
-        background: Some(Color::from_rgb8(240, 253, 244).into()),
+        background: Some(Color::from_rgb8(239, 246, 255).into()),
         text_color: None,
         shadow: iced::Shadow::default(),
         snap: false,
     })
-    .into()
-}
-
-fn signed_details_view(response: &SignedTransactionResponse) -> Element<'_, Message> {
-    column![
-        text("Transaction Signed").size(16),
-        column![
-            detail_row("Request ID".into(), response.request_id.clone()),
-            detail_row("Public Key".into(), response.public_key.clone()),
-            detail_row("Signature".into(), response.signature.clone()),
-        ]
-        .spacing(8),
-    ]
-    .spacing(12)
-    .into()
-}
-
-fn exported_view(path: &PathBuf) -> Element<'_, Message> {
-    column![
-        text("Response Exported").size(16),
-        column![
-            detail_row("Path".into(), path.display().to_string()),
-            text("Transfer this file to the online machine for broadcasting.").size(13),
-        ]
-        .spacing(8),
-    ]
-    .spacing(12)
-    .into()
 }
 
 fn actions_row(sign_state: &SignState) -> Element<'_, Message> {
@@ -910,12 +1084,12 @@ fn actions_row(sign_state: &SignState) -> Element<'_, Message> {
         }
         SignState::Signed(_) => {
             actions = actions.push(
-                button(text("Export Response").size(16))
+                button(text("Save").size(16))
                     .padding([12, 18])
                     .on_press(Message::ExportPressed),
             );
         }
-        SignState::Exported(_) | SignState::Idle => {
+        SignState::Exported | SignState::Idle => {
             actions = actions.push(
                 button(text("Reset").size(14))
                     .padding([8, 16])
@@ -928,23 +1102,47 @@ fn actions_row(sign_state: &SignState) -> Element<'_, Message> {
 }
 
 fn find_signing_key(accounts: &[UnlockedAccount], request: &UnsignedTransactionRequest) -> Result<SecretKey, String> {
-    let verified = verify_transfer_request(request).map_err(|e| e.to_string())?;
-    let account = accounts
+    let verified = verify_request(request).map_err(|e| e.to_string())?;
+    let signer_id = verified_signer_id(&verified);
+    let signer_public_key = verified_signer_public_key(&verified);
+    let matching_accounts: Vec<&UnlockedAccount> = accounts
         .iter()
-        .find(|account| account.account_id == verified.signer_id)
-        .ok_or_else(|| format!("no Keychain account matches signer {}", verified.signer_id))?;
+        .filter(|account| account.account_id == *signer_id)
+        .collect();
 
-    let secret_key = derive_secret_key(account);
-    let derived_public_key = secret_key.public_key().to_string();
-
-    if derived_public_key != verified.signer_public_key {
-        return Err(format!(
-            "keychain mnemonic for {} derives public key {}, but the transaction expects {}",
-            account.account_id, derived_public_key, verified.signer_public_key
-        ));
+    if matching_accounts.is_empty() {
+        return Err(format!("no Keychain account matches signer {signer_id}"));
     }
 
-    Ok(secret_key)
+    matching_accounts
+        .into_iter()
+        .find_map(|account| {
+            let secret_key = derive_secret_key(account);
+            let derived_public_key = secret_key.public_key().to_string();
+            (derived_public_key == *signer_public_key).then_some(secret_key)
+        })
+        .ok_or_else(|| {
+            format!(
+                "no saved mnemonic for {} derives the expected public key {}",
+                signer_id, signer_public_key
+            )
+        })
+}
+
+fn verified_signer_id(request: &VerifiedRequest) -> &String {
+    match request {
+        VerifiedRequest::Transfer(request) => &request.signer_id,
+        VerifiedRequest::DeleteKey(request) => &request.signer_id,
+        VerifiedRequest::AddKey(request) => &request.signer_id,
+    }
+}
+
+fn verified_signer_public_key(request: &VerifiedRequest) -> &String {
+    match request {
+        VerifiedRequest::Transfer(request) => &request.signer_public_key,
+        VerifiedRequest::DeleteKey(request) => &request.signer_public_key,
+        VerifiedRequest::AddKey(request) => &request.signer_public_key,
+    }
 }
 
 fn derive_secret_key(account: &UnlockedAccount) -> SecretKey {
@@ -954,6 +1152,10 @@ fn derive_secret_key(account: &UnlockedAccount) -> SecretKey {
 
 fn derive_public_key(account: &UnlockedAccount) -> String {
     derive_secret_key(account).public_key().to_string()
+}
+
+fn derive_public_key_from_mnemonic(mnemonic: &str) -> Result<String, String> {
+    Ok(derive_secret_key_from_mnemonic(mnemonic)?.public_key().to_string())
 }
 
 fn derive_secret_key_from_mnemonic(mnemonic: &str) -> Result<SecretKey, String> {
@@ -1014,6 +1216,48 @@ fn field<'a>(label: &'static str, value: &'a str, on_input: fn(String) -> Messag
         text(label).size(14),
         text_input(label, value)
             .on_input(on_input)
+            .padding(12)
+            .size(16)
+            .width(Length::Fill),
+    ]
+    .spacing(8)
+    .width(Length::Fill)
+    .into()
+}
+
+fn copy_icon_button<'a>() -> iced::widget::Button<'a, Message> {
+    button(
+        svg(svg::Handle::from_path(COPY_ICON_PATH))
+            .width(Length::Fixed(16.0))
+            .height(Length::Fixed(16.0)),
+    )
+    .padding([10, 16])
+    .style(|theme, status| {
+        let mut style = iced::widget::button::text(theme, status);
+        style.background = match status {
+            button::Status::Hovered => Some(Background::Color(Color::from_rgba8(99, 102, 241, 0.08))),
+            button::Status::Pressed => Some(Background::Color(Color::from_rgba8(99, 102, 241, 0.16))),
+            _ => None,
+        };
+        style.border = Border {
+            width: 1.0,
+            radius: 10.0.into(),
+            color: if matches!(status, button::Status::Pressed) {
+                Color::from_rgba8(99, 102, 241, 0.28)
+            } else {
+                Color::TRANSPARENT
+            },
+        };
+        style
+    })
+}
+
+fn field_secure<'a>(label: &'static str, value: &'a str, on_input: fn(String) -> Message) -> Element<'a, Message> {
+    column![
+        text(label).size(14),
+        text_input(label, value)
+            .on_input(on_input)
+            .secure(true)
             .padding(12)
             .size(16)
             .width(Length::Fill),
@@ -1092,6 +1336,174 @@ fn detail_row(label: String, value: String) -> Element<'static, Message> {
     row![text(label).size(14), text(value).size(14)].spacing(12).into()
 }
 
+fn top_bar(language: Option<SupportLanguage>) -> Element<'static, Message> {
+    let spacer = container(text("")).width(Length::Fill);
+    let title = row![
+        container(
+            container(text("🔐").size(18))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+        )
+        .width(40)
+        .height(40)
+        .style(|_| iced::widget::container::Style {
+            border: Border {
+                width: 2.0,
+                radius: 999.0.into(),
+                color: Color::from_rgb8(139, 92, 246),
+            },
+            ..Default::default()
+        }),
+        column![
+            text("Airgap Offline").size(24),
+            text("Cold machine").size(13).color(Color::from_rgb8(107, 114, 128))
+        ]
+        .spacing(2)
+    ]
+    .spacing(14)
+    .align_y(Alignment::Center);
+
+    let trailing: Element<'static, Message> = match language {
+        Some(selected_language) => topbar_picker(
+            &SUPPORTED_LANGUAGES,
+            Some(selected_language),
+            Message::LanguageChanged,
+            160.0,
+        ),
+        None => container(text("Vault locked").size(13).color(Color::from_rgb8(107, 114, 128)))
+            .padding([8, 0])
+            .into(),
+    };
+
+    container(row![title, spacer, trailing].spacing(16).align_y(Alignment::Center))
+        .padding([20, 28])
+        .width(Length::Fill)
+        .style(|_| iced::widget::container::Style {
+            background: Some(Background::Color(Color::WHITE)),
+            ..Default::default()
+        })
+        .into()
+}
+
+fn hero_section(active_tab: Tab) -> Element<'static, Message> {
+    let (eyebrow, title, subtitle) = match active_tab {
+        Tab::Sign => (
+            "OFFLINE SIGNING",
+            "Verify requests and sign transactions in an isolated flow",
+            "Bring in the unsigned request, verify every field against the transaction bytes, then export the signed response back to the online machine.",
+        ),
+        Tab::Accounts => (
+            "OFFLINE KEYCHAIN",
+            "Keep saved mnemonics encrypted until the session is unlocked",
+            "Store account mnemonics locally, decrypt them only in memory for the active session, and derive signing keys when needed.",
+        ),
+        Tab::Mnemonic => (
+            "MNEMONIC LAB",
+            "Generate fresh recovery phrases fully offline",
+            "Create 12-word phrases without touching the network, then move them into your secure backup and vault workflow.",
+        ),
+        Tab::Password => (
+            "VAULT PASSWORD",
+            "Rotate your session password and migrate encrypted history safely",
+            "Verify the current password, re-encrypt all saved keychain mnemonics with the new password, then return to the login screen.",
+        ),
+    };
+
+    container(
+        column![
+            text(eyebrow).size(13).color(Color::from_rgb8(72, 110, 255)),
+            text(title).size(36),
+            text(subtitle).size(16).color(Color::from_rgb8(95, 103, 120)),
+        ]
+        .spacing(10)
+        .max_width(760),
+    )
+    .padding([32, 36])
+    .width(Length::Fill)
+    .style(|_| iced::widget::container::Style {
+        background: Some(Background::Color(Color::from_rgb8(240, 244, 255))),
+        border: Border {
+            width: 1.0,
+            radius: 24.0.into(),
+            color: Color::from_rgb8(220, 228, 255),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+fn tab_strip(active_tab: Tab) -> Element<'static, Message> {
+    container(
+        row![
+            top_tab_button("Sign", Tab::Sign, active_tab),
+            top_tab_button("Mnemonic", Tab::Mnemonic, active_tab),
+            top_tab_button("Keychain", Tab::Accounts, active_tab),
+            top_tab_button("Password", Tab::Password, active_tab),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Shrink)
+    .into()
+}
+
+fn top_tab_button<'a>(label: &'static str, tab: Tab, active_tab: Tab) -> Element<'a, Message> {
+    let is_active = tab == active_tab;
+    let mut tab_button = button(text(label).size(15))
+        .padding([10, 18])
+        .style(move |theme, status| {
+            if is_active {
+                button::primary(theme, status)
+            } else {
+                button::secondary(theme, status)
+            }
+        });
+    if !is_active {
+        tab_button = tab_button.on_press(Message::TabSelected(tab));
+    }
+    tab_button.into()
+}
+
+fn topbar_picker<'a, T>(
+    options: &'a [T],
+    selected: Option<T>,
+    on_selected: impl Fn(T) -> Message + 'static,
+    width: f32,
+) -> Element<'a, Message>
+where
+    T: ToString + Clone + PartialEq + 'a,
+{
+    pick_list(options, selected, on_selected).width(width).into()
+}
+
+fn section_heading<'a>(title: &'static str, subtitle: &'static str) -> Element<'a, Message> {
+    column![
+        text(title).size(28),
+        text(subtitle).size(15).color(Color::from_rgb8(95, 103, 120)),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn card_style() -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(Background::Color(Color::WHITE)),
+        border: Border {
+            width: 1.0,
+            radius: 24.0.into(),
+            color: Color::from_rgb8(229, 231, 235),
+        },
+        shadow: iced::Shadow {
+            color: Color::from_rgba8(15, 23, 42, 0.06),
+            offset: iced::Vector::new(0.0, 12.0),
+            blur_radius: 32.0,
+        },
+        ..Default::default()
+    }
+}
+
 fn format_near_amount(yocto_str: &str) -> String {
     if let Ok(yocto) = yocto_str.parse::<u128>() {
         let whole = yocto / 10u128.pow(24);
@@ -1114,11 +1526,9 @@ fn mask_mnemonic(mnemonic: &str) -> String {
         return "Mnemonic is empty".to_owned();
     }
 
-    match (words.first(), words.last()) {
-        (Some(first), Some(last)) if words.len() > 2 => {
-            format!("{first} ... {last} ({} words)", words.len())
-        }
-        _ => format!("{} word(s)", words.len()),
+    match words.last() {
+        Some(last) => format!("... {last} ({} words)", words.len()),
+        None => format!("{} word(s)", words.len()),
     }
 }
 
@@ -1186,6 +1596,87 @@ async fn unlock_or_initialize_session(db: sled::Db, password: String) -> Result<
     })
 }
 
+async fn change_vault_password(
+    db: sled::Db,
+    current_password: String,
+    new_password: String,
+    confirm_new_password: String,
+) -> Result<(), String> {
+    if current_password.is_empty() {
+        return Err("current password is required".to_owned());
+    }
+    if new_password.is_empty() {
+        return Err("new password is required".to_owned());
+    }
+    if new_password != confirm_new_password {
+        return Err("new password confirmation does not match".to_owned());
+    }
+
+    let salt = db
+        .get(VAULT_SALT_KEY)
+        .map_err(|e| format!("failed to read vault salt: {e}"))?
+        .ok_or_else(|| "vault metadata is incomplete".to_owned())?;
+    let stored_verifier = db
+        .get(VAULT_VERIFIER_KEY)
+        .map_err(|e| format!("failed to read vault verifier: {e}"))?
+        .ok_or_else(|| "vault metadata is incomplete".to_owned())?;
+    let stored_verifier = std::str::from_utf8(stored_verifier.as_ref())
+        .map_err(|e| format!("stored vault verifier is not valid UTF-8: {e}"))?;
+
+    PasswordPolicy::verify_password(&current_password, stored_verifier)
+        .await
+        .map_err(|e| e.to_string())?;
+    PasswordPolicy::default()
+        .validate_password(&new_password)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let current_key_vec = derive_key(&current_password, &labeled_salt(salt.as_ref(), b"encryption"))?;
+    let current_key: [u8; KEY_LEN] = current_key_vec
+        .try_into()
+        .map_err(|_| "derived an invalid current encryption key length".to_owned())?;
+
+    let decrypted_accounts = load_stored_accounts(&db)?
+        .into_iter()
+        .map(|account| {
+            let mnemonic = decrypt_secret(&current_key, &account.encrypted_mnemonic)?;
+            Ok((account.account_id, mnemonic))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let new_salt = random_bytes(16)?;
+    let new_verifier = PasswordPolicy::hash_password(&new_password)
+        .await
+        .map_err(|e| e.to_string())?;
+    let new_key_vec = derive_key(&new_password, &labeled_salt(&new_salt, b"encryption"))?;
+    let new_key: [u8; KEY_LEN] = new_key_vec
+        .try_into()
+        .map_err(|_| "derived an invalid new encryption key length".to_owned())?;
+
+    let migrated_accounts = decrypted_accounts
+        .into_iter()
+        .map(|(account_id, mnemonic)| {
+            Ok(StoredAccount {
+                account_id,
+                encrypted_mnemonic: encrypt_secret(&new_key, &mnemonic)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let bytes = serde_json::to_vec_pretty(&migrated_accounts)
+        .map_err(|e| format!("failed to encode migrated accounts: {e}"))?;
+    db.insert(VAULT_SALT_KEY, new_salt)
+        .map_err(|e| format!("failed to store new vault salt: {e}"))?;
+    db.insert(VAULT_VERIFIER_KEY, new_verifier.as_bytes())
+        .map_err(|e| format!("failed to store new vault verifier: {e}"))?;
+    db.insert(ACCOUNTS_DB_KEY, bytes)
+        .map_err(|e| format!("failed to store migrated accounts: {e}"))?;
+    db.flush()
+        .map_err(|e| format!("failed to flush password migration: {e}"))?;
+
+    Ok(())
+}
+
 fn save_account(
     db: &sled::Db,
     session: &mut VaultSession,
@@ -1205,8 +1696,13 @@ fn save_account(
         return Err("mnemonic is required".to_owned());
     }
 
-    if session.accounts.iter().any(|account| account.account_id == account_id) {
-        return Err("that account is already saved".to_owned());
+    let candidate_public_key = derive_public_key_from_mnemonic(mnemonic)?;
+    if session
+        .accounts
+        .iter()
+        .any(|account| account.account_id == account_id && derive_public_key(account) == candidate_public_key)
+    {
+        return Err("that account and public key are already saved".to_owned());
     }
 
     let mut stored_accounts = load_stored_accounts(db)?;
@@ -1237,6 +1733,54 @@ fn load_stored_accounts(db: &sled::Db) -> Result<Vec<StoredAccount>, String> {
         Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("failed to decode stored accounts: {e}")),
         None => Ok(vec![]),
     }
+}
+
+fn remove_account(
+    db: &sled::Db,
+    session: &mut VaultSession,
+    account_id: &str,
+    public_key: &str,
+) -> Result<String, String> {
+    let trimmed = account_id.trim();
+    if trimmed.is_empty() {
+        return Err("account is required".to_owned());
+    }
+    let trimmed_public_key = public_key.trim();
+    if trimmed_public_key.is_empty() {
+        return Err("public key is required".to_owned());
+    }
+
+    let mut stored_accounts = load_stored_accounts(db)?;
+    let original_len = stored_accounts.len();
+    stored_accounts.retain(|account| {
+        if account.account_id != trimmed {
+            return true;
+        }
+
+        match decrypt_secret(&session.encryption_key, &account.encrypted_mnemonic)
+            .and_then(|mnemonic| derive_public_key_from_mnemonic(&mnemonic))
+        {
+            Ok(derived_public_key) => derived_public_key != trimmed_public_key,
+            Err(_) => true,
+        }
+    });
+    if stored_accounts.len() == original_len {
+        return Err(format!(
+            "account {trimmed} with public key {trimmed_public_key} was not found in the offline keychain"
+        ));
+    }
+
+    let bytes = serde_json::to_vec_pretty(&stored_accounts).map_err(|e| format!("failed to encode accounts: {e}"))?;
+    db.insert(ACCOUNTS_DB_KEY, bytes)
+        .map_err(|e| format!("failed to store account removal: {e}"))?;
+    db.flush()
+        .map_err(|e| format!("failed to flush account removal: {e}"))?;
+
+    session
+        .accounts
+        .retain(|account| !(account.account_id == trimmed && derive_public_key(account) == trimmed_public_key));
+
+    Ok(trimmed.to_owned())
 }
 
 fn labeled_salt(base_salt: &[u8], label: &[u8]) -> Vec<u8> {
@@ -1310,7 +1854,7 @@ async fn load_request(path: String) -> Result<LoadedRequest, String> {
 
     let content = fs::read_to_string(&path).map_err(|e| format!("failed to read request file: {e}"))?;
     let request = request_from_json(&content).map_err(|e| e.to_string())?;
-    let verified = verify_transfer_request(&request).map_err(|e| e.to_string())?;
+    let verified = verify_request(&request).map_err(|e| e.to_string())?;
     Ok(LoadedRequest { request, verified })
 }
 
@@ -1321,15 +1865,6 @@ async fn export_response(response: SignedTransactionResponse, output: PathBuf) -
     }
     fs::write(&output, json).map_err(|e| format!("failed to write response file: {e}"))?;
     Ok(output)
-}
-
-fn build_split_layout() -> pane_grid::State<LayoutPane> {
-    let (mut layout, sidebar) = pane_grid::State::new(LayoutPane::Sidebar);
-    if let Some((main, split)) = layout.split(pane_grid::Axis::Vertical, sidebar, LayoutPane::Main) {
-        let _ = main;
-        layout.resize(split, SIDEBAR_RATIO);
-    }
-    layout
 }
 
 fn reset_vault(db: &sled::Db) -> Result<(), String> {

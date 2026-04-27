@@ -11,10 +11,10 @@ tokio = { version = "1.52", features = ["full", "time"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["local-time"] }
+tracing-subscriber = { version = "0.3", features = ["local-time", "env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-iced = "0.14"
+iced = { version = "0.14", features = ["svg"] }
 near-primitives = "0.34"
 near-crypto = "0.34"
 base64 = "0.22"
@@ -39,3 +39,4 @@ uuid = { version = "1.23", features = [
     "macro-diagnostics",
 ] }
 sled = "0.34"
+thiserror = "2"

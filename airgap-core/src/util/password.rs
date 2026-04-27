@@ -6,33 +6,24 @@ use argon2::{
 };
 use std::{
     collections::HashSet,
-    fmt,
     sync::{Arc, RwLock},
 };
+use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Error)]
 pub enum PasswordError {
+    #[error("password length must be between 6 and 1024 characters")]
     InvalidLength,
+    #[error("password is found in HIBP")]
     FoundInHibp,
+    #[error("invalid session password")]
     VerifyFailed,
+    #[error("{0}")]
     HashFailed(String),
+    #[error("{0}")]
     InvalidStoredHash(String),
 }
-
-impl fmt::Display for PasswordError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidLength => write!(f, "password length must be between 12 and 1024 characters"),
-            Self::FoundInHibp => write!(f, "password is found in HIBP"),
-            Self::VerifyFailed => write!(f, "invalid session password"),
-            Self::HashFailed(message) => write!(f, "{message}"),
-            Self::InvalidStoredHash(message) => write!(f, "{message}"),
-        }
-    }
-}
-
-impl std::error::Error for PasswordError {}
 
 #[derive(Default, Debug, Clone)]
 pub struct PasswordPolicy {
@@ -60,7 +51,7 @@ impl PasswordPolicy {
 
     pub async fn validate_password(&self, password: &str) -> Result<(), PasswordError> {
         let password = normalize_password(password);
-        if !(12..=1024).contains(&password.chars().count()) {
+        if !(6..=1024).contains(&password.chars().count()) {
             return Err(PasswordError::InvalidLength);
         }
 
@@ -84,7 +75,10 @@ impl PasswordPolicy {
 
         password_argon2()?
             .verify_password(password.as_bytes(), &parsed_hash)
-            .map_err(map_password_verify_error)
+            .map_err(|error| match error {
+                PasswordHashError::Password => PasswordError::VerifyFailed,
+                other => PasswordError::HashFailed(format!("failed to verify session password: {other}")),
+            })
     }
 
     pub async fn hash_password(password: &str) -> Result<String, PasswordError> {
@@ -110,11 +104,4 @@ fn password_argon2() -> Result<Argon2<'static>, PasswordError> {
 
 fn normalize_password(password: &str) -> String {
     password.nfc().collect::<String>()
-}
-
-fn map_password_verify_error(error: PasswordHashError) -> PasswordError {
-    match error {
-        PasswordHashError::Password => PasswordError::VerifyFailed,
-        other => PasswordError::HashFailed(format!("failed to verify session password: {other}")),
-    }
 }
